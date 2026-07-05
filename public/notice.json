@@ -42,6 +42,20 @@
       "date": "2026-07-05",
       "showOnce": true,
       "showOnStartup": false
+    },
+    {
+      "id": "system-2026-07-05-04",
+      "kind": "system",
+      "title": {
+        "zh": "福利推送"
+      },
+      "body": {
+        "zh": "deepseek官方apikey  用完即无\nmodel-id：deepseek-v4-pro\n<red>sk-eb4d640d09b7447688e36504d28f87ba</red>\n\nbase_url (OpenAI)\t\nhttps://api.deepseek.com\nbase_url (Anthropic)\nhttps://api.deepseek.com/anthropic"
+      },
+      "level": "info",
+      "date": "2026-07-05",
+      "showOnce": true,
+      "showOnStartup": true
     }
   ]
 }
