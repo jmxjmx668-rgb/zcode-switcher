@@ -12,6 +12,19 @@
 - Release 中必须包含 `latest.json`。如果这个文件缺失，软件内检测更新会失败。
 - GitHub Actions 已显式开启 `includeUpdaterJson`，并优先使用 Windows NSIS 安装包生成更新清单。
 
+## macOS DMG
+
+- macOS 源码与构建流水线放在 `git-l-1031/zcode-switcher-mac`。
+- DMG 构建成功后作为 workflow artifact 保存；需要发布时，手动构建可通过
+  `release_tag` 输入把 DMG 上传到 `git-l-1031/zcode-switcher` 的现有 Release。
+- 跨仓库上传需要在 Mac 仓库配置仅对正式仓库具有 Release 写权限的
+  `RELEASE_REPO_TOKEN`。
+- 正式公开发布前必须补 Apple Developer ID 签名与公证；当前流水线先用 ad-hoc 签名保证应用包完整性，仍按内测包发布。
+- macOS 自动更新接入时，必须合并 `darwin-aarch64` 与 Windows 平台信息，不能用单平台
+  `latest.json` 覆盖正式仓库中的更新清单。
+- `.github/workflows/test-macos-release.yml` 会在真实 Apple Silicon Runner 上下载正式 Release
+  DMG，验证哈希、镜像结构、arm64 架构、代码签名完整性和 15 秒启动存活。
+
 ## GitHub Secrets
 
 发布前需要在仓库的 Actions Secrets 中配置：

@@ -9,7 +9,7 @@
 <img src="https://raw.githubusercontent.com/git-l-1031/zcode-switcher/main/src/assets/zcode-logo.png" alt="ZCode Switcher Logo" width="132" />
 
 <p><strong>ZCode 账号管理与无感切换桌面工具</strong></p>
-<p>无需重启 · 额度显示 · 自动切换 · 胶囊悬浮窗 · 应用内更新</p>
+<p>本地账号库 · 额度显示 · 自动切换 · 胶囊悬浮窗 · 应用内更新</p>
 
 [![Release](https://img.shields.io/github/v/release/git-l-1031/zcode-switcher?style=flat-square)](https://github.com/git-l-1031/zcode-switcher/releases)
 [![Downloads](https://img.shields.io/github/downloads/git-l-1031/zcode-switcher/total?style=flat-square)](https://github.com/git-l-1031/zcode-switcher/releases)
@@ -27,7 +27,7 @@
 
 ## 简介
 
-ZCode Switcher 用于本地切换和管理多个 ZCode 账号，无需重启即可切换账号，支持额度显示，账号池悬浮窗以及 GLM-5.2 低额度自动切换。
+ZCode Switcher 用于本地保存和管理多个 ZCode 账号，支持额度显示、无感切换账号无需重启，以及 GLM-5.2 低额度自动切换。
 
 所有账号档案保存在本机，不上传到第三方服务器。
 
@@ -37,7 +37,6 @@ ZCode Switcher 用于本地切换和管理多个 ZCode 账号，无需重启即�
 | --- | --- |
 | 本地账号管理 | 保存、重命名、删除、批量删除多个账号 |
 | JSON 导入导出 | 方便备份、迁移账号档案 |
-| Oauth授权 |账密官网登录，自动捕获token|
 | 无感切换 | 无需重启 ZCode，切换账号后即时同步配置 |
 | 额度显示 | 显示额度、订阅状态和刷新结果 |
 | GLM-5.2 自动切换 | 额度低于阈值时，自动切到剩余额度更高的账号 |
@@ -101,8 +100,6 @@ macOS 安装包尚未完成 Apple Developer ID 公证，首次打开可能需要
 - [发布说明](docs/release.md)
 
 ## 提示
-
-本仓库并非开源仓库。
 
 导出的 JSON 和本地账号档案包含敏感信息，请妥善保存，不要上传到公开位置。
 

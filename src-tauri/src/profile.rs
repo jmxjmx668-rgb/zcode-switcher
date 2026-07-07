@@ -750,9 +750,9 @@ fn zcode_jwt_from_credentials(cred_bytes: &[u8]) -> R<Option<String>> {
 ///     塞 zcodejwttoken 不工作，还会冒出一个重复的 "Coding Plan" 条目。
 ///   - `builtin:{family}`（无后缀）→ 同为自带 API Key 入口。
 ///
-/// - `mode == "oauth"`：JWT **只写 start-plan**。同时把 coding-plan 里**残留的 JWT 清掉**
-///   （apiKey 以 `eyJ` 开头 = 是误写进去的 plan token），但保留用户真正自带的 Z.ai API Key
-///   （非 JWT 格式，不动）。
+/// - `mode == "oauth"`：JWT **只写 start-plan**。同时清空 coding-plan / 无后缀入口的
+///   apiKey。ZCode 3.1.4 在 oauth 模式下仍会优先选择带非空 apiKey 的 coding-plan，
+///   如果这里保留旧 API Key，就会切到新账号后仍走旧账号/旧额度状态。
 /// - `mode == "apikey"`：从 profile 存的 `stored_keys` 里取 `builtin:{family}` 的值写回。
 ///
 /// 其它 family 的 provider 一律不动。
@@ -767,9 +767,9 @@ fn prepare_config_provider_keys_update(
         return Ok(None);
     }
 
-    // (provider_id, 要写入的 apiKey)；另有"清掉残留 JWT"的目标单独处理。
+    // (provider_id, 要写入的 apiKey)；另有切到 oauth 时必须清空的 API Key 入口。
     let mut target_writes: Vec<(String, String)> = Vec::new();
-    let mut clear_jwt_targets: Vec<String> = Vec::new();
+    let mut clear_api_key_targets: Vec<String> = Vec::new();
     let plan_start = format!("builtin:{}-start-plan", family);
     let plan_coding = format!("builtin:{}-coding-plan", family);
     let plain_key = format!("builtin:{}", family);
@@ -779,9 +779,10 @@ fn prepare_config_provider_keys_update(
             return Ok(None);
         };
         target_writes.push((plan_start, jwt));
-        // coding-plan / 无后缀 都是 api.z.ai 入口，不该有 plan JWT；清掉残留的（之前误写）
-        clear_jwt_targets.push(plan_coding);
-        clear_jwt_targets.push(plain_key);
+        // coding-plan / 无后缀 都是 api.z.ai 入口；oauth 切号时不能保留旧 API Key，
+        // 否则 ZCode 会优先走 coding-plan 而不是 start-plan。
+        clear_api_key_targets.push(plan_coding);
+        clear_api_key_targets.push(plain_key);
     } else if mode == "apikey" {
         let Some(apikey) = stored_keys.get(&plain_key) else {
             return Ok(None);
@@ -814,20 +815,19 @@ fn prepare_config_provider_keys_update(
         options.insert("apiKey".to_string(), Value::String(target_val.clone()));
         changed = true;
     }
-    // 清残留 JWT：仅当该 provider 当前 apiKey 是 JWT（eyJ 开头）才清空，保留真·API Key。
-    for target_id in &clear_jwt_targets {
+    for target_id in &clear_api_key_targets {
         let Some(prov) = providers.get_mut(target_id) else {
             continue;
         };
         let Some(options) = prov.get_mut("options").and_then(Value::as_object_mut) else {
             continue;
         };
-        let is_stale_jwt = options
+        let has_api_key = options
             .get("apiKey")
             .and_then(Value::as_str)
-            .map(|k| k.starts_with("eyJ"))
+            .map(|k| !k.is_empty())
             .unwrap_or(false);
-        if is_stale_jwt {
+        if has_api_key {
             options.insert("apiKey".to_string(), Value::String(String::new()));
             changed = true;
         }
@@ -1084,6 +1084,7 @@ pub fn switch_to(id: String) -> R<Profile> {
         &mode,
         &profile.provider_api_keys,
     )?;
+    let should_refresh_zcode_balance = config_update.is_some();
     let setting_update = prepare_setting_route_update(&family, &mode).ok().flatten();
 
     // 备份当前
@@ -1118,11 +1119,6 @@ pub fn switch_to(id: String) -> R<Profile> {
             }
             return Err(e);
         }
-        // CDP 无感切号：切号后 +0.5s / +3s / +5s 通过 Chrome DevTools Protocol 远程调用
-        // ZCode 内部的 modelProviderService.refreshCodingPlanApiKey，让它立即重读 config.json
-        // 并重建聊天 session。端口未开（用户未启用快捷方式增强）时静默失败，等 ZCode 自己
-        // ~30s 轮询兜底。
-        crate::zcode_cdp::schedule_post_switch_refresh();
     }
     // 锁定 modelProviderFamilyModes.zai = "oauth" 与 providerFamilyDomain = "zai"，
     // 否则跨用户导入后 ZCode 可能路由到 builtin:zai（自带 API Key 入口）报 missing API key。
@@ -1137,6 +1133,12 @@ pub fn switch_to(id: String) -> R<Profile> {
         if let Ok(cache) = zcode_v2_dir().map(|d| d.join("coding-plan-cache.json")) {
             let _ = fs::remove_file(&cache);
         }
+    }
+
+    if should_refresh_zcode_balance {
+        // CDP 无感切号：配置、路由与旧权益缓存都处理完后，再通过 Chrome DevTools Protocol
+        // 触发 ZCode 内部 provider/权益刷新，避免今日余额面板继续读切换前的快照。
+        crate::zcode_cdp::schedule_post_switch_refresh();
     }
 
     profiles[idx].updated_at = now_ts();
@@ -1575,7 +1577,15 @@ pub fn open_config_dir() -> R<()> {
             .spawn()
             .map_err(err)?;
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        Command::new("open")
+            .arg(dir.as_os_str())
+            .spawn()
+            .map_err(err)?;
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = dir;
     }

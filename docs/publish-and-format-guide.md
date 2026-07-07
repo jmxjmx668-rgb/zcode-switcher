@@ -12,6 +12,7 @@
 npm run build
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
 cargo check --manifest-path src-tauri/Cargo.toml
+npm run notice:check
 ```
 
 4. 需要正式安装包时再运行：
@@ -139,12 +140,45 @@ https://example.com
 }
 ```
 
-## 公告发布规则
+## 公告预览与编辑
 
-- 软件在线时优先读取 GitHub 仓库 `main/public/notice.json`；只改本地文件不会让已安装软件立刻看到新公告。
+启动可编辑预览：
+
+```powershell
+npm run notice:preview
+```
+
+也可以在项目根目录双击 `notice-preview.cmd`，它会自动启动同一个预览服务并打开浏览器。
+
+打开后是中文可视化公告编辑器。支持：
+
+- 新增系统公告或临时公告。
+- 用表单编辑公告 ID、类型、等级、日期、弹出策略、中文标题和中文正文。
+- 在正文中一键插入红色重点、普通链接、隐藏链接名和后台下载链接。
+- 右侧按软件内公告弹窗样式实时预览，tab、公告卡片、链接样式和“知道了”按钮会尽量与正式界面一致。
+- 展开“高级 JSON”后可查看或手动修改原始 JSON，也可以打开 `/json` 使用旧版 JSON 编辑器。
+- 点击“保存”或按 `Ctrl+S` 写回 `public/notice.json`。
+
+路径与生效规则：
+
+- 默认编辑文件按脚本自身定位为项目根目录的 `public/notice.json`，不依赖当前命令行目录。
+- `--input` 指定自定义文件时，相对路径仍按当前命令行目录解析。
+- 预览脚本是源码仓库工具，不会随普通安装后的软件提供给最终用户。
+- 软件在线时优先读取 GitHub 仓库 `main/public/notice.json`；只在本地保存不会让已安装软件立刻看到新公告。
 - 正式发布公告需要把 `public/notice.json` 推送到 GitHub；安装包内置公告仅作为远程读取失败时的兜底。
 - 如果 `showOnce` 为 `true` 且公告 ID 没变，用户关闭过后不会再次自动弹出；需要再次自动弹出时请换一个新的 `id`。
-- 公告预览编辑工具只保留在开发目录，发布目录不上传该脚本。
+
+只校验不打开页面：
+
+```powershell
+npm run notice:check
+```
+
+指定文件、端口或语言：
+
+```powershell
+node scripts/preview-notice.mjs --input public/notice.json --port 4178 --lang zh
+```
 
 ## 发布后检查
 

@@ -97,7 +97,9 @@ interface ShortcutInfo {
   has_flag?: boolean;
 }
 
-/** 无感切换合并开关：一个 toggle 同时控制设置项和快捷方式增强；附带"还原快捷方式"按钮 */
+const IS_MACOS = /Macintosh|Mac OS X/.test(navigator.userAgent);
+
+/** 无感切换合并开关：Windows 配置快捷方式，macOS 由 Switcher 增强启动 ZCode。 */
 function NoRestartSwitchRow({
   language,
   on,
@@ -129,15 +131,17 @@ function NoRestartSwitchRow({
   const enabled = (shortcuts ?? []).filter((s) => s.has_flag ?? s.hasFlag).length;
   const total = (shortcuts ?? []).length;
 
-  let status = t.launcherEnhanceStatusNone;
+  let status = IS_MACOS ? t.launcherEnhanceStatusNoneMac : t.launcherEnhanceStatusNone;
   if (total > 0) {
     status =
       enabled === total
-        ? formatText(t.launcherEnhanceStatusAll, { total })
+        ? IS_MACOS
+          ? t.launcherEnhanceStatusAllMac
+          : formatText(t.launcherEnhanceStatusAll, { total })
         : formatText(t.launcherEnhanceStatusPartial, { enabled, total });
   }
 
-  const desc = `${t.noRestartDesc}\n${status}`;
+  const desc = `${IS_MACOS ? t.noRestartDescMac : t.noRestartDesc}\n${status}`;
 
   const handleToggle = async () => {
     if (busy) return;
@@ -153,7 +157,12 @@ function NoRestartSwitchRow({
         "zcode_launcher_enable"
       );
       if (res.total === 0) {
-        toast(t.launcherEnhanceNoneFoundToast, "warn");
+        toast(
+          IS_MACOS ? t.launcherEnhanceNoneFoundToastMac : t.launcherEnhanceNoneFoundToast,
+          "warn"
+        );
+      } else if (IS_MACOS) {
+        toast(t.launcherEnhanceEnabledToastMac, "success");
       } else if (res.modified > 0) {
         toast(
           formatText(t.launcherEnhanceEnabledToast, {
@@ -176,7 +185,12 @@ function NoRestartSwitchRow({
     setBusy(true);
     try {
       const restored = await invoke<number>("zcode_launcher_disable");
-      toast(formatText(t.launcherEnhanceDisabledToast, { restored }), "success");
+      toast(
+        IS_MACOS
+          ? t.launcherEnhanceDisabledToastMac
+          : formatText(t.launcherEnhanceDisabledToast, { restored }),
+        "success"
+      );
       await refresh();
     } catch (e) {
       toast(formatText(t.launcherEnhanceFailedToast, { error: String(e) }), "error");
@@ -195,7 +209,7 @@ function NoRestartSwitchRow({
             disabled={busy}
             className="focus-ring rounded-lg border border-base-border bg-base-card px-2.5 py-1 text-[11px] text-text-secondary transition hover:bg-base-cardhover active:scale-[0.97] disabled:opacity-50"
           >
-            {t.launcherEnhanceDisable}
+            {IS_MACOS ? t.launcherEnhanceDisableMac : t.launcherEnhanceDisable}
           </button>
         )}
       </div>

@@ -15,13 +15,25 @@ use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, Signal, System, UpdateKind}
 
 use crate::profile::AppError;
 
-/// 目标进程名（跨平台）。
+/// 目标进程名（跨平台）。macOS 查找主程序路径时只认 `ZCode`，避免误把 Helper
+/// 的可执行文件路径保存成下次启动目标；结束进程时仍覆盖所有 Helper。
 #[cfg(target_os = "windows")]
 const PROC_NAMES: &[&str] = &["ZCode.exe"];
 #[cfg(target_os = "macos")]
-const PROC_NAMES: &[&str] = &["ZCode", "ZCode Helper"];
+const PROC_NAMES: &[&str] = &[
+    "ZCode",
+    "ZCode Helper",
+    "ZCode Helper (GPU)",
+    "ZCode Helper (Plugin)",
+    "ZCode Helper (Renderer)",
+];
 #[cfg(target_os = "linux")]
 const PROC_NAMES: &[&str] = &["zcode", "ZCode"];
+
+#[cfg(target_os = "macos")]
+const MAIN_PROC_NAMES: &[&str] = &["ZCode"];
+#[cfg(not(target_os = "macos"))]
+const MAIN_PROC_NAMES: &[&str] = PROC_NAMES;
 
 type R<T> = std::result::Result<T, AppError>;
 
@@ -78,14 +90,16 @@ pub fn restart_zcode() -> R<()> {
     if let Some(ref p) = running_path {
         let _ = save_known_path(p);
     }
-    let exe_path = running_path.or_else(load_known_path).ok_or_else(|| {
+    // 2. 先查增强启动入口。macOS 未运行时也可由已记录的 ZCode.app 路径启动。
+    let preferred = crate::zcode_launcher::find_preferred_shortcut();
+    let exe_path = running_path.or_else(load_known_path);
+    #[cfg(target_os = "macos")]
+    let exe_path = exe_path.or_else(|| preferred.as_ref().map(|entry| entry.target.clone()));
+    let exe_path = exe_path.ok_or_else(|| {
         AppError::Msg(
             "找不到 ZCode 进程路径，也没有已保存的安装路径。请手动打开一次 ZCode 后再试。".into(),
         )
     })?;
-
-    // 2. 先查快捷方式（kill 之前，避免误判）。
-    let preferred = crate::zcode_launcher::find_preferred_shortcut();
 
     // 3. kill 全部同名进程
     kill_all_zcode();
@@ -185,7 +199,10 @@ fn find_main_path() -> Option<String> {
 
     for (_pid, proc_) in sys.processes() {
         let name = proc_.name().to_string_lossy().to_string();
-        if PROC_NAMES.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+        if MAIN_PROC_NAMES
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(&name))
+        {
             if let Some(path) = proc_.exe().and_then(|p| p.to_str()) {
                 if !path.is_empty() {
                     return Some(path.to_string());
@@ -297,13 +314,30 @@ fn kill_all_zcode() {
 fn spawn_zcode(exe_path: &str) -> R<()> {
     use std::process::Command;
 
-    Command::new(exe_path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| AppError::Msg(format!("重启 ZCode 失败：{}", e)))?;
-    Ok(())
+    #[cfg(target_os = "macos")]
+    {
+        let app = macos_app_bundle(exe_path).unwrap_or_else(|| PathBuf::from(exe_path));
+        Command::new("/usr/bin/open")
+            .arg("-n")
+            .arg(app)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| AppError::Msg(format!("重启 ZCode 失败：{}", e)))?;
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Command::new(exe_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| AppError::Msg(format!("重启 ZCode 失败：{}", e)))?;
+        Ok(())
+    }
 }
 
 /// 用 target + 命令行字符串拉起 ZCode（保留 --remote-debugging-port=9229 等参数）。
@@ -312,12 +346,40 @@ fn spawn_zcode_with_args(exe_path: &str, args: &str) -> R<()> {
     use std::process::Command;
 
     let tokens: Vec<&str> = args.split_whitespace().collect();
-    Command::new(exe_path)
-        .args(&tokens)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| AppError::Msg(format!("重启 ZCode 失败：{}", e)))?;
-    Ok(())
+    #[cfg(target_os = "macos")]
+    {
+        let app = macos_app_bundle(exe_path).unwrap_or_else(|| PathBuf::from(exe_path));
+        let mut command = Command::new("/usr/bin/open");
+        command.arg("-n").arg(app);
+        if !tokens.is_empty() {
+            command.arg("--args").args(&tokens);
+        }
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| AppError::Msg(format!("重启 ZCode 失败：{}", e)))?;
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Command::new(exe_path)
+            .args(&tokens)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| AppError::Msg(format!("重启 ZCode 失败：{}", e)))?;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_app_bundle(path: &str) -> Option<PathBuf> {
+    std::path::Path::new(path)
+        .ancestors()
+        .find(|part| part.extension().and_then(|ext| ext.to_str()) == Some("app"))
+        .map(std::path::Path::to_path_buf)
 }
