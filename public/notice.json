@@ -1,19 +1,4 @@
 {
   "enabled": true,
-  "notices": [
-    {
-      "id": "system-2026-08-13-01",
-      "kind": "system",
-      "title": {
-        "zh": "公告"
-      },
-      "body": {
-        "zh": "加群908448730免费获取账号"
-      },
-      "level": "warn",
-      "date": "2026-08-13",
-      "showOnce": true,
-      "showOnStartup": true
-    }
-  ]
+  "notices": []
 }
