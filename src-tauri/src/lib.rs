@@ -329,76 +329,15 @@ fn default_download_filename() -> String {
     format!("download-{}", timestamp)
 }
 
-/// 把 zcodeswitcher:// 协议注册到当前用户（HKCU\Software\Classes），
-/// 浏览器 OAuth 授权完成后据此拉起本应用并传递回调 URL。
-/// 裸 exe（--no-bundle 构建）没有安装器代劳，只能运行时自行注册；
-/// 用 reg.exe 命令实现，避免引入 windows-registry 额外依赖。
-#[cfg(windows)]
-fn register_app_scheme() {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-    let Ok(exe_path) = std::env::current_exe() else {
-        return;
-    };
-    let quoted = format!("\"{}\"", exe_path.to_string_lossy().replace('"', ""));
-    let open_command = format!("{} \"%L\"", quoted);
-    let base = r"HKCU\Software\Classes\zcodeswitcher";
-
-    let runs = [
-        vec![
-            "add".to_string(),
-            base.to_string(),
-            "/ve".to_string(),
-            "/t".to_string(),
-            "REG_SZ".to_string(),
-            "/d".to_string(),
-            "ZCode Switcher OAuth".to_string(),
-            "/f".to_string(),
-        ],
-        vec![
-            "add".to_string(),
-            base.to_string(),
-            "/v".to_string(),
-            "URL Protocol".to_string(),
-            "/t".to_string(),
-            "REG_SZ".to_string(),
-            "/d".to_string(),
-            String::new(),
-            "/f".to_string(),
-        ],
-        vec![
-            "add".to_string(),
-            format!(r"{}\shell\open\command", base),
-            "/ve".to_string(),
-            "/t".to_string(),
-            "REG_SZ".to_string(),
-            "/d".to_string(),
-            open_command,
-            "/f".to_string(),
-        ],
-    ];
-    for args in runs {
-        let _ = std::process::Command::new("reg")
-            .args(&args)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-    }
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {    tauri::Builder::default()
+pub fn run() {
+    tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        // 单实例：OAuth 深链接拉起新进程时，把启动参数转发给已在运行的主实例后退出
-        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+        // 单实例：重复启动时聚焦已有窗口（OAuth 走服务端轮询通道，无需深链接）
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             use tauri::Manager;
-            for arg in argv.iter().skip(1) {
-                if oauth::handle_deep_link_argument(&arg) {
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.set_focus();
-                    }
-                    break;
-                }
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_focus();
             }
         }))
         .plugin(tauri_plugin_dialog::init())
@@ -406,12 +345,7 @@ pub fn run() {    tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             captcha::init(app.handle().clone());
-            // 运行时注册 zcodeswitcher:// 协议（裸 exe 场景安装器不会写注册表；
-            // 写 HKCU 无需管理员权限，浏览器授权完成后据此拉起本应用）
-            #[cfg(windows)]
-            register_app_scheme();
-            // 应用启动时处理命令行参数里的 OAuth 深链接回调
-            // （首次启动即被协议拉起的场景；运行中被拉起则走单实例转发）
+            // 兼容旧版深链接启动参数（上一版 exe 注册过协议的场景）
             for arg in std::env::args().skip(1) {
                 if oauth::handle_deep_link_argument(&arg) {
                     break;

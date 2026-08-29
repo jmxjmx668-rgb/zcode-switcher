@@ -1,50 +1,36 @@
-//! ZCode OAuth 登录导入。
+//! ZCode OAuth 登录导入（CLI 轮询通道版）。
 //!
-//! 旧的 /oauth/cli/init + /oauth/cli/poll 接口已经不可用。新版 ZCode 客户端
-//! 使用 Z.ai 授权码流程：
-//!   1. 打开 chat.z.ai/api/oauth/authorize
-//!   2. 授权完成后经 zcode.z.ai/app/oauth/login 中转页重定向到深链接回调
-//!      （旧版 127.0.0.1 临时端口回调已被服务端 redirect_uri 白名单拒绝，
-//!      报 "Redirect URI not registered for this client"；实测白名单只认
-//!      zcode.z.ai 中转页，但中转页的 redirect 参数允许自定义 scheme）
-//!   3. POST zcode.z.ai/api/v1/oauth/token 交换 ZCode JWT 与 Z.ai access token
-//!   4. POST api.z.ai/api/auth/z/login 把 Z.ai token 换成 ZCode 业务 access token
+//! 历史演进：本地 127.0.0.1 回调 → 被服务端 redirect_uri 白名单拒绝；
+//! 中转页 + 自定义深链接 → 被中转页前端 JS 的 zcode:// 硬校验拒绝。
+//! 现采用 ZCode 3.10.1 官方 CLI 同款轮询通道（无需任何回调/协议注册）：
+//!   1. POST zcode.z.ai/api/v1/oauth/cli/init → flow_id + 服务端托管的
+//!      authorize_url + poll_token（redirect_uri 由服务端自行管理）
+//!   2. 用户浏览器完成授权，结果由服务端保管
+//!   3. GET /api/v1/oauth/cli/poll/<flow_id>（Bearer poll_token）轮询：
+//!      pending → 继续等；ready → 响应直接携带全部 token（服务端已完成
+//!      code 交换，客户端无需再调 token 接口）
+//!   4. POST api.z.ai/api/auth/z/login 把 zai access_token 换业务 token
 //!   5. 组装 portable JSON，复用 profile::import_profile_json 导入账号
-//!
-//! 回调捕获走双通道：
-//!   - 主通道：本应用注册的 zcodeswitcher:// 深链接（Windows 协议注册，
-//!     浏览器授权完成后系统拉起本 exe，启动参数里带回调 URL）
-//!   - 备通道：本地 127.0.0.1 回调服务器（万一服务端恢复对 loopback 的放行）
 
-use axum::{
-    extract::{Query, State},
-    response::Html,
-    routing::get,
-    Router,
-};
 use rand::RngCore;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    net::SocketAddr,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Mutex, OnceLock},
     time::Duration,
 };
-use tokio::{net::TcpListener, sync::oneshot};
+use tokio::sync::oneshot;
 
-const AUTHORIZE_URL: &str = "https://chat.z.ai/api/oauth/authorize";
 const TOKEN_URL: &str = "https://zcode.z.ai/api/v1/oauth/token";
 const USERINFO_URL: &str = "https://chat.z.ai/api/oauth/userinfo";
 const BUSINESS_LOGIN_URL: &str = "https://api.z.ai/api/auth/z/login";
-const CLIENT_ID: &str = "client_P8X5CMWmlaRO9gyO-KSqtg";
-const CALLBACK_PATH: &str = "/oauth/callback";
+const CLI_INIT_URL: &str = "https://zcode.z.ai/api/v1/oauth/cli/init";
+const CLI_POLL_BASE: &str = "https://zcode.z.ai/api/v1/oauth/cli/poll";
 const DEFAULT_DEADLINE_SECONDS: u64 = 600;
 const HTTP_TIMEOUT_SECONDS: u64 = 20;
-/// 本应用注册的自定义协议：授权完成后浏览器经中转页拉起本应用
+/// 本应用协议名（保留深链接入口的识别，仅用于兼容旧启动参数场景）
 const APP_SCHEME: &str = "zcodeswitcher";
-/// 官方中转页（服务端 redirect_uri 白名单目前只认 zcode.z.ai 域）
-const OAUTH_RELAY_PAGE: &str = "https://zcode.z.ai/app/oauth/login";
 
 #[derive(Debug, Serialize)]
 pub struct OAuthInit {
@@ -56,8 +42,18 @@ pub struct OAuthInit {
 struct PendingFlow {
     state: String,
     redirect_uri: String,
-    receiver: oneshot::Receiver<Result<CallbackData, String>>,
+    receiver: Option<oneshot::Receiver<Result<CallbackData, String>>>,
     shutdown: Option<oneshot::Sender<()>>,
+    poll: Option<PollFlow>,
+}
+
+/// CLI 轮询流程（ZCode 3.10.1 同款通道）
+struct PollFlow {
+    flow_id: String,
+    poll_token: String,
+    /// Unix 秒
+    expires_at: i64,
+    poll_interval_sec: u64,
 }
 
 /// 深链接回调投递通道：协议拉起本 exe 时（启动参数带回调 URL），
@@ -106,29 +102,10 @@ pub fn handle_deep_link_argument(arg: &str) -> bool {
     }
 }
 
-#[derive(Clone)]
-struct CallbackServerState {
-    sender: Arc<Mutex<Option<oneshot::Sender<Result<CallbackData, String>>>>>,
-}
-
 #[derive(Debug)]
 struct CallbackData {
     code: String,
     state: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct CallbackQuery {
-    #[serde(default)]
-    code: Option<String>,
-    #[serde(default, rename = "authCode")]
-    auth_code: Option<String>,
-    #[serde(default)]
-    state: Option<String>,
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    error_description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,6 +128,29 @@ struct TokenData {
     user: Option<Value>,
     #[serde(default)]
     zai: Option<ZaiTokens>,
+    // cli/init 响应字段
+    #[serde(default)]
+    flow_id: Option<String>,
+    #[serde(default, rename = "flowId")]
+    flow_id_alt: Option<String>,
+    #[serde(default, rename = "authorize_url")]
+    authorize_url: Option<String>,
+    #[serde(default, rename = "authorizeUrl")]
+    authorize_url_alt: Option<String>,
+    #[serde(default)]
+    poll_token: Option<String>,
+    #[serde(default, rename = "pollToken")]
+    poll_token_alt: Option<String>,
+    #[serde(default)]
+    expires_at: Option<i64>,
+    #[serde(default, rename = "expiresAt")]
+    expires_at_alt: Option<i64>,
+    #[serde(default)]
+    poll_interval_sec: Option<u64>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    bigmodel: Option<ZaiTokens>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -240,120 +240,6 @@ fn body_preview(body: &str) -> String {
     body.chars().take(300).collect::<String>()
 }
 
-fn callback_html(title: &str, message: &str) -> Html<String> {
-    Html(format!(
-        r#"<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{title}</title>
-  <style>
-    body {{ margin: 0; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f7f8fb; color: #17202a; }}
-    main {{ min-height: 100vh; display: grid; place-items: center; padding: 24px; box-sizing: border-box; }}
-    section {{ max-width: 520px; padding: 28px; background: white; border: 1px solid #e7e9ef; border-radius: 16px; box-shadow: 0 18px 45px rgba(20, 26, 40, .08); }}
-    h1 {{ margin: 0 0 12px; font-size: 22px; }}
-    p {{ margin: 0; line-height: 1.7; color: #53606f; }}
-  </style>
-</head>
-<body>
-  <main>
-    <section>
-      <h1>{title}</h1>
-      <p>{message}</p>
-    </section>
-  </main>
-</body>
-</html>"#
-    ))
-}
-
-async fn oauth_callback(
-    State(server_state): State<CallbackServerState>,
-    Query(query): Query<CallbackQuery>,
-) -> Html<String> {
-    let error = query.error.as_deref().unwrap_or_default().trim();
-    let description = query
-        .error_description
-        .as_deref()
-        .unwrap_or_default()
-        .trim();
-
-    let (result, title, message) = if !error.is_empty() {
-        let detail = if description.is_empty() {
-            error.to_string()
-        } else {
-            format!("{}: {}", error, description)
-        };
-        (
-            Err(format!("OAuth 登录被拒绝:{}", detail)),
-            "登录失败",
-            "Z.ai 返回了登录失败信息，可以关闭此页面回到 ZCode Switcher 重试。",
-        )
-    } else {
-        let code = query
-            .code
-            .or(query.auth_code)
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let state = query.state.unwrap_or_default().trim().to_string();
-        if code.is_empty() || state.is_empty() {
-            (
-                Err("OAuth 回调缺少 code 或 state".to_string()),
-                "登录失败",
-                "OAuth 回调参数不完整，可以关闭此页面回到 ZCode Switcher 重试。",
-            )
-        } else {
-            (
-                Ok(CallbackData { code, state }),
-                "登录完成",
-                "授权信息已收到，可以关闭此页面回到 ZCode Switcher。",
-            )
-        }
-    };
-
-    let sent = server_state
-        .sender
-        .lock()
-        .ok()
-        .and_then(|mut sender| sender.take())
-        .map(|sender| sender.send(result).is_ok())
-        .unwrap_or(false);
-
-    if sent {
-        callback_html(title, message)
-    } else {
-        callback_html(
-            "流程已结束",
-            "这次 OAuth 登录流程已经结束或超时，可以关闭此页面回到 ZCode Switcher。",
-        )
-    }
-}
-
-fn build_authorize_url(state: &str, redirect_uri: &str) -> Result<String, String> {
-    let mut url =
-        reqwest::Url::parse(AUTHORIZE_URL).map_err(|e| format!("授权地址解析失败:{}", e))?;
-    url.query_pairs_mut()
-        .append_pair("redirect_uri", redirect_uri)
-        .append_pair("response_type", "code")
-        .append_pair("client_id", CLIENT_ID)
-        .append_pair("state", state);
-    Ok(url.to_string())
-}
-
-/// 构造新版 redirect_uri：官方中转页 + 指定最终深链接。
-/// 服务端白名单只认 zcode.z.ai 中转页；中转页的 redirect 参数允许
-/// 自定义 scheme（实测 zcodeswitcher:// 与官方 zcode:// 均放行）。
-fn build_relay_redirect_uri(final_redirect: &str) -> Result<String, String> {
-    let mut url = reqwest::Url::parse(OAUTH_RELAY_PAGE)
-        .map_err(|e| format!("中转页地址解析失败:{}", e))?;
-    url.query_pairs_mut()
-        .append_pair("redirect", final_redirect)
-        .append_pair("app_version", crate::captcha::ZCODE_APP_VERSION);
-    Ok(url.to_string())
-}
-
 /// 从回调 URL（深链接或 HTTP）解析 code/state
 fn parse_callback_url(url_str: &str) -> Option<CallbackData> {
     let url = reqwest::Url::parse(url_str.trim()).ok()?;
@@ -374,88 +260,69 @@ fn parse_callback_url(url_str: &str) -> Option<CallbackData> {
     Some(CallbackData { code, state })
 }
 
-async fn start_callback_server(
-    state: String,
-) -> Result<
-    (
-        String,
-        oneshot::Receiver<Result<CallbackData, String>>,
-        oneshot::Sender<()>,
-    ),
-    String,
-> {
-    let (sender, receiver) = oneshot::channel();
-    let (shutdown, shutdown_rx) = oneshot::channel();
-    let server_state = CallbackServerState {
-        sender: Arc::new(Mutex::new(Some(sender))),
-    };
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .map_err(|e| format!("本地 OAuth 回调端口启动失败:{}", e))?;
-    let addr: SocketAddr = listener
-        .local_addr()
-        .map_err(|e| format!("读取本地 OAuth 回调端口失败:{}", e))?;
-    let app = Router::new()
-        .route(CALLBACK_PATH, get(oauth_callback))
-        .with_state(server_state);
-    tokio::spawn(async move {
-        let server = axum::serve(listener, app).with_graceful_shutdown(async {
-            let _ = shutdown_rx.await;
-        });
-        let _ = server.await;
-    });
-    let redirect_uri = format!("http://{}{}", addr, CALLBACK_PATH);
-    let _ = state;
-    Ok((redirect_uri, receiver, shutdown))
-}
-
-/// 初始化新版 Z.ai OAuth 流程。
+/// 初始化新版 Z.ai OAuth 轮询流程。
+///
+/// 服务端提供 CLI 轮询通道（ZCode 3.10.1 同款）：
+///   1. POST /api/v1/oauth/cli/init  → 拿 flow_id + 服务端托管的 authorize_url + poll_token
+///   2. 用户浏览器完成授权后，结果由服务端保管
+///   3. GET /api/v1/oauth/cli/poll/<flow_id>（Bearer poll_token）轮询，
+///      status: pending → 等待；ready → 直接携带全部 token（服务端已完成 code 交换）
 ///
 /// 为了兼容前端旧接口字段：
-/// - flow_id = state
-/// - poll_token = redirect_uri（新版为中转页 URL）
-///
-/// 回调捕获双通道：
-/// - 主通道 zcodeswitcher:// 深链接（本 exe 注册的协议，浏览器授权后拉起）
-/// - 备通道本地 127.0.0.1 HTTP 回调（防止服务端将来恢复 loopback 放行）
+/// - flow_id = 服务端 flow_id
+/// - poll_token = 服务端 poll_token
 #[tauri::command]
 pub async fn oauth_init() -> Result<OAuthInit, String> {
-    let state = random_hex(24);
+    let client = http_client()?;
 
-    // 主通道：深链接 oneshot
-    let (deep_sender, deep_receiver) = oneshot::channel::<Result<CallbackData, String>>();
+    // 客户端随机 token 用于 init 请求；服务端会在响应里返回正式 poll_token
+    let bootstrap_token = random_hex(32);
+    let resp = client
+        .post(CLI_INIT_URL)
+        .header("Authorization", format!("Bearer {}", bootstrap_token))
+        .json(&serde_json::json!({ "provider": "zai" }))
+        .send()
+        .await
+        .map_err(|e| format!("OAuth 初始化请求失败:{}", e))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("OAuth 初始化响应读取失败:{}", e))?;
+    if !status.is_success() {
+        return Err(format!("OAuth 初始化 HTTP {}:{}", status, body_preview(&body)));
+    }
+    let envelope: TokenEnvelope = serde_json::from_str(&body)
+        .map_err(|e| format!("OAuth 初始化响应解析失败:{}", e))?;
+    if !is_success_code(envelope.code.as_ref()) {
+        return Err(format!(
+            "OAuth 初始化被拒绝:{}",
+            envelope_message(envelope.msg, envelope.message, "未知错误")
+        ));
+    }
+    let data = envelope.data.ok_or("OAuth 初始化响应缺少 data")?;
+
+    let flow_id = data
+        .flow_id
+        .clone()
+        .or_else(|| data.flow_id_alt.clone())
+        .unwrap_or_default();
+    let authorize_url = data
+        .authorize_url
+        .clone()
+        .or_else(|| data.authorize_url_alt.clone())
+        .unwrap_or_default();
+    let poll_token = data
+        .poll_token
+        .clone()
+        .or_else(|| data.poll_token_alt.clone())
+        .unwrap_or_default();
+    let expires_at = data.expires_at.or(data.expires_at_alt).unwrap_or(0);
+    let poll_interval = data.poll_interval_sec.unwrap_or(2).max(1);
+    if flow_id.is_empty() || authorize_url.is_empty() || poll_token.is_empty() || expires_at == 0
     {
-        let mut slot = deep_link_channel()
-            .lock()
-            .map_err(|_| "OAuth 流程状态锁定失败".to_string())?;
-        // 清掉残留的旧 sender
-        *slot = Some(deep_sender);
+        return Err("OAuth 初始化响应字段不完整".into());
     }
-    // 消费可能早到的深链接回调（单实例转发竞态下先于 init 到达）
-    if let Ok(mut early) = early_deep_link().lock() {
-        if let Some(callback) = early.take() {
-            if callback.state == state
-                && deep_link_channel()
-                    .lock()
-                    .ok()
-                    .and_then(|mut slot| slot.take())
-                    .map(|sender| sender.send(Ok(callback)).is_ok())
-                    .unwrap_or(false)
-            {
-                // 已即时投递，直接进入等待（会被立刻唤醒）
-            }
-        }
-    }
-
-    // 备通道：本地 HTTP 回调服务器（http_redirect_uri 仅用于启动服务器本身，
-    // 不参与新版 redirect_uri；保留服务器等待将来服务端恢复 loopback 放行）
-    let (_http_redirect_uri, http_receiver, http_shutdown) =
-        start_callback_server(state.clone()).await?;
-
-    // redirect_uri 走官方中转页，最终深链接指向本应用协议
-    let deep_callback = format!("{}://{}", APP_SCHEME, "oauth/callback");
-    let redirect_uri = build_relay_redirect_uri(&deep_callback)?;
-    let authorize_url = build_authorize_url(&state, &redirect_uri)?;
 
     let mut pending = pending_flow()
         .lock()
@@ -466,36 +333,23 @@ pub async fn oauth_init() -> Result<OAuthInit, String> {
         }
     }
     *pending = Some(PendingFlow {
-        state: state.clone(),
-        redirect_uri: redirect_uri.clone(),
-        receiver: merge_receivers(deep_receiver, http_receiver),
-        shutdown: Some(http_shutdown),
+        state: flow_id.clone(),
+        redirect_uri: poll_token.clone(),
+        receiver: None,
+        shutdown: None,
+        poll: Some(PollFlow {
+            flow_id,
+            poll_token,
+            expires_at,
+            poll_interval_sec: poll_interval,
+        }),
     });
 
     Ok(OAuthInit {
-        flow_id: state,
+        flow_id: pending.as_ref().unwrap().state.clone(),
         authorize_url,
-        poll_token: redirect_uri,
+        poll_token: pending.as_ref().unwrap().redirect_uri.clone(),
     })
-}
-
-/// 合并深链接与 HTTP 两条回调通道：任一先到即胜出。
-fn merge_receivers(
-    deep: oneshot::Receiver<Result<CallbackData, String>>,
-    http: oneshot::Receiver<Result<CallbackData, String>>,
-) -> oneshot::Receiver<Result<CallbackData, String>> {
-    let (sender, receiver) = oneshot::channel();
-    tokio::spawn(async move {
-        tokio::select! {
-            result = deep => {
-                let _ = sender.send(result.unwrap_or(Err("深链接回调通道已关闭".into())));
-            }
-            result = http => {
-                let _ = sender.send(result.unwrap_or(Err("OAuth 回调通道已关闭".into())));
-            }
-        }
-    });
-    receiver
 }
 
 /// 等待本地回调，交换 token，并导入账号。
@@ -528,11 +382,24 @@ async fn acquire_with_pending(
     deadline_seconds: Option<u64>,
 ) -> Result<crate::profile::Profile, String> {
     let PendingFlow {
-        state,
-        redirect_uri,
+        state: _,
+        redirect_uri: _,
         receiver,
         mut shutdown,
+        poll,
     } = pending;
+
+    // 轮询模式：CLI 轮询通道（主方案）
+    if let Some(poll_flow) = poll {
+        shutdown_pending(&mut shutdown);
+        let _ = receiver; // 轮询模式无回调通道
+        return acquire_via_polling(poll_flow, deadline_seconds).await;
+    }
+
+    // 回调模式（保留兼容：万一走到没有 poll 的流程）
+    let Some(receiver) = receiver else {
+        return Err("OAuth 流程状态无效，请重新发起登录".into());
+    };
     let deadline = Duration::from_secs(deadline_seconds.unwrap_or(DEFAULT_DEADLINE_SECONDS));
     let callback = match tokio::time::timeout(deadline, receiver).await {
         Ok(Ok(Ok(callback))) => callback,
@@ -551,12 +418,119 @@ async fn acquire_with_pending(
     };
     shutdown_pending(&mut shutdown);
 
-    if callback.state != state {
-        return Err("OAuth state 校验失败，请重新发起登录".into());
-    }
+    let client = http_client()?;
+    let token_data = exchange_oauth_token(&client, &callback.code, "", "").await?;
+    finish_import_from_token_data(&client, token_data).await
+}
+
+/// CLI 轮询通道：循环 GET /api/v1/oauth/cli/poll/<flow_id>，
+/// status=ready 时响应直接携带全部 token（服务端已完成 code 交换）。
+async fn acquire_via_polling(
+    poll_flow: PollFlow,
+    deadline_seconds: Option<u64>,
+) -> Result<crate::profile::Profile, String> {
+    let PollFlow {
+        flow_id,
+        poll_token,
+        expires_at,
+        poll_interval_sec,
+    } = poll_flow;
 
     let client = http_client()?;
-    let token_data = exchange_oauth_token(&client, &callback.code, &redirect_uri, &state).await?;
+    let poll_url = format!("{}/{}", CLI_POLL_BASE, urlencode(&flow_id));
+    let deadline = Duration::from_secs(deadline_seconds.unwrap_or(DEFAULT_DEADLINE_SECONDS));
+    let hard_deadline = tokio::time::Instant::now() + deadline;
+    // 服务端给的有效期（Unix 秒 → Instant），轮询不能超过它
+    let server_deadline = tokio::time::Instant::now()
+        + Duration::from_secs((expires_at - chrono_now_secs()).max(1) as u64);
+    let effective_deadline = hard_deadline.min(server_deadline);
+    let interval = Duration::from_secs(poll_interval_sec.min(5));
+
+    loop {
+        if tokio::time::Instant::now() >= effective_deadline {
+            return Err("等待 OAuth 登录超时".into());
+        }
+        let resp = client
+            .get(&poll_url)
+            .header("Authorization", format!("Bearer {}", poll_token))
+            .send()
+            .await;
+        match resp {
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                if status.is_success() {
+                    if let Ok(envelope) = serde_json::from_str::<TokenEnvelope>(&body) {
+                        if is_success_code(envelope.code.as_ref()) {
+                            if let Some(data) = envelope.data {
+                                match data.status.as_deref() {
+                                    Some("pending") | None => {}
+                                    Some("failed") => {
+                                        return Err("OAuth flow 授权失败".into())
+                                    }
+                                    Some("ready") => {
+                                        return finish_import_from_token_data(&client, data)
+                                            .await;
+                                    }
+                                    Some(other) => {
+                                        return Err(format!("OAuth flow 状态异常:{}", other))
+                                    }
+                                }
+                            }
+                        } else {
+                            return Err(format!(
+                                "OAuth 轮询被拒绝:{}",
+                                envelope_message(
+                                    envelope.msg,
+                                    envelope.message,
+                                    "未知错误"
+                                )
+                            ));
+                        }
+                    }
+                } else if status.as_u16() >= 400 && status.as_u16() < 500 {
+                    // 4xx（除限流）：流程已失效，直接报错
+                    return Err(format!(
+                        "OAuth 轮询失败（HTTP {}）:{}",
+                        status,
+                        body_preview(&body)
+                    ));
+                }
+                // 5xx/429/解析失败：当作临时故障继续轮询
+            }
+            Err(_) => {
+                // 网络错误：继续轮询直到 deadline
+            }
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+fn chrono_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn urlencode(s: &str) -> String {
+    let mut out = String::new();
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    out
+}
+
+/// 从 token 数据（轮询 ready 响应或 token 交换响应）完成导入。
+async fn finish_import_from_token_data(
+    client: &Client,
+    token_data: TokenData,
+) -> Result<crate::profile::Profile, String> {
     let zcode_jwt = token_data
         .token
         .as_deref()
@@ -571,12 +545,12 @@ async fn acquire_with_pending(
     if zai_access_token.is_empty() {
         return Err("Token 交换失败:响应缺少 data.zai.access_token".into());
     }
-    let business_access_token = exchange_business_token(&client, &zai_access_token).await?;
+    let business_access_token = exchange_business_token(client, &zai_access_token).await?;
     let mut user = token_data
         .user
         .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
     if !has_meaningful_user(&user) {
-        if let Some(fetched) = fetch_user_info(&client, &business_access_token).await {
+        if let Some(fetched) = fetch_user_info(client, &business_access_token).await {
             user = fetched;
         }
     }
