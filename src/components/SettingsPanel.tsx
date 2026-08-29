@@ -225,6 +225,9 @@ function SectionTitle({ children }: { children: React.ReactNode }) {
   );
 }
 
+/** 当前账号刷新间隔档位（秒）：5 秒 ~ 5 分钟共九档 */
+const ACTIVE_REFRESH_OPTIONS = [5, 10, 15, 30, 60, 120, 180, 240, 300];
+
 function ActionButton({
   icon,
   label,
@@ -328,12 +331,14 @@ export default function SettingsPanel() {
   const {
     quotaRefreshIntervalMinutes,
     setQuotaRefreshIntervalMinutes,
-    activeQuotaRefreshIntervalMinutes,
-    setActiveQuotaRefreshIntervalMinutes,
+    activeQuotaRefreshIntervalSeconds,
+    setActiveQuotaRefreshIntervalSeconds,
     glm52AutoSwitchEnabled,
     setGlm52AutoSwitchEnabled,
     glm52AutoSwitchThresholdWan,
     setGlm52AutoSwitchThresholdWan,
+    smartActivateEnabled,
+    setSmartActivateEnabled,
     autoRestart,
     setAutoRestart,
     tryNoRestartSwitch,
@@ -502,6 +507,17 @@ export default function SettingsPanel() {
         />
       </Row>
 
+      <Row
+        icon={<ShieldCheck size={15} />}
+        title={t.smartActivateTitle}
+        desc={t.smartActivateDesc}
+      >
+        <Toggle
+          on={smartActivateEnabled}
+          onClick={() => setSmartActivateEnabled(!smartActivateEnabled)}
+        />
+      </Row>
+
       <SectionTitle>{t.quota}</SectionTitle>
 
       <Row
@@ -542,16 +558,17 @@ export default function SettingsPanel() {
         desc={glm52AutoSwitchEnabled ? t.activeRefreshDescAuto : t.activeRefreshDesc}
       >
         <select
-          value={activeQuotaRefreshIntervalMinutes}
+          value={activeQuotaRefreshIntervalSeconds}
           onChange={(e) =>
-            setActiveQuotaRefreshIntervalMinutes(Number(e.currentTarget.value))
+            setActiveQuotaRefreshIntervalSeconds(Number(e.currentTarget.value))
           }
-          disabled={glm52AutoSwitchEnabled}
-          className="focus-ring h-8 rounded-lg border border-base-border bg-base-card px-2 text-sm font-semibold text-text-primary outline-none transition hover:bg-base-cardhover disabled:opacity-50"
+          className="focus-ring h-8 rounded-lg border border-base-border bg-base-card px-2 text-sm font-semibold text-text-primary outline-none transition hover:bg-base-cardhover"
         >
-          {[1, 2, 3, 4, 5].map((minute) => (
-            <option key={minute} value={minute}>
-              {formatText(t.minuteOption, { count: minute })}
+          {ACTIVE_REFRESH_OPTIONS.map((seconds) => (
+            <option key={seconds} value={seconds}>
+              {seconds < 60
+                ? formatText(t.secondOption, { count: seconds })
+                : formatText(t.minuteOption, { count: seconds / 60 })}
             </option>
           ))}
         </select>

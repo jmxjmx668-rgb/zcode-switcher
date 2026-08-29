@@ -91,7 +91,7 @@ export default function App() {
     hideAccountIdentity,
     language,
     quotaRefreshIntervalMinutes,
-    activeQuotaRefreshIntervalMinutes,
+    activeQuotaRefreshIntervalSeconds,
     glm52AutoSwitchEnabled,
     glm52AutoSwitchThresholdWan,
     floatingWindowMode,
@@ -283,9 +283,11 @@ export default function App() {
 
   useEffect(() => {
     if (!activeProfile) return;
-    const intervalMs = glm52AutoSwitchEnabled
-      ? 20 * 1000
-      : activeQuotaRefreshIntervalMinutes * 60 * 1000;
+    // 秒制间隔；自动切换开启时不比原固定 20 秒更慢：min(用户设定, 20)
+    const intervalMs =
+      glm52AutoSwitchEnabled
+        ? Math.min(activeQuotaRefreshIntervalSeconds, 20) * 1000
+        : activeQuotaRefreshIntervalSeconds * 1000;
     activeQuotaRefreshDueAt.current = Date.now() + intervalMs;
     const timer = window.setInterval(() => {
       refreshActiveQuotaForAutoSwitch();
@@ -294,7 +296,7 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [
     activeProfile,
-    activeQuotaRefreshIntervalMinutes,
+    activeQuotaRefreshIntervalSeconds,
     glm52AutoSwitchEnabled,
     refreshActiveQuotaForAutoSwitch,
   ]);
@@ -316,9 +318,10 @@ export default function App() {
       }
       if (!activeProfile || didBatchRefresh || now < activeQuotaRefreshDueAt.current) return;
       refreshActiveQuotaForAutoSwitch();
-      const intervalMs = glm52AutoSwitchEnabled
-        ? 20 * 1000
-        : activeQuotaRefreshIntervalMinutes * 60 * 1000;
+      const intervalMs =
+        glm52AutoSwitchEnabled
+          ? Math.min(activeQuotaRefreshIntervalSeconds, 20) * 1000
+          : activeQuotaRefreshIntervalSeconds * 1000;
       activeQuotaRefreshDueAt.current = now + intervalMs;
     };
     window.addEventListener("focus", refreshIfOverdue);
@@ -329,7 +332,7 @@ export default function App() {
     };
   }, [
     activeProfile,
-    activeQuotaRefreshIntervalMinutes,
+    activeQuotaRefreshIntervalSeconds,
     glm52AutoSwitchEnabled,
     quotaRefreshIntervalMinutes,
     scheduledRefreshAllQuota,

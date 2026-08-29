@@ -109,6 +109,16 @@ struct BillingBalanceData {
 
 /// 用某份 credentials.json（JSON 文本）查询其额度。
 pub async fn fetch_quota(creds_text: &str) -> Result<QuotaInfo, String> {
+    fetch_quota_impl(creds_text, true).await
+}
+
+/// 同 fetch_quota，但**不读日志兜底**：仅以实时接口结果为准。
+/// 用途：切号后的智能激活判定——日志里的余额可能属于切换前的账号，不可采信。
+pub async fn fetch_quota_live(creds_text: &str) -> Result<QuotaInfo, String> {
+    fetch_quota_impl(creds_text, false).await
+}
+
+async fn fetch_quota_impl(creds_text: &str, allow_log_fallback: bool) -> Result<QuotaInfo, String> {
     let creds: Value =
         serde_json::from_str(creds_text).map_err(|e| format!("解析 credentials 失败：{}", e))?;
     let token =
@@ -121,7 +131,12 @@ pub async fn fetch_quota(creds_text: &str) -> Result<QuotaInfo, String> {
 
     let balance = match fetch_billing_balance(&client, &token).await {
         Ok(balance) => balance,
-        Err(e) => latest_logged_balance_for_current_token(&token).ok_or(e)?,
+        Err(e) => {
+            if !allow_log_fallback {
+                return Err(e);
+            }
+            latest_logged_balance_for_current_token(&token).ok_or(e)?
+        }
     };
     let (plan_name, plan_description, plan_status, plan_ends_at) = pick_best_plan(balance.plans);
     let balances: Vec<BalanceItem> = balance

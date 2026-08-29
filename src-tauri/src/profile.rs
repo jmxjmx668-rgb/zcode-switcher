@@ -1058,9 +1058,139 @@ pub fn capture_current(name: String) -> R<Profile> {
     Ok(profile)
 }
 
+/// switch_to 的返回值：档案字段 + 智能激活标记。
+#[derive(Serialize)]
+pub struct SwitchOutcome {
+    #[serde(flatten)]
+    pub profile: Profile,
+    /// true：目标账号未激活，已自动重置机器码并清理套餐缓存，
+    /// 用户还需在 ZCode 里发送一条消息完成激活。
+    pub activation_prepared: bool,
+}
+
+/// 生成 RFC 4122 v4 UUID（设备标识重置用）。
+fn new_uuid_v4() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// 所有可能存放 telemetry-state.json 的 v2 目录（home 设置目录 + 数据目录，去重）。
+fn telemetry_candidate_dirs() -> R<Vec<PathBuf>> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(d) = zcode_settings_dir() {
+        dirs.push(d);
+    }
+    if let Ok(d) = zcode_v2_dir() {
+        dirs.push(d);
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for dir in dirs {
+        let duplicated = out
+            .iter()
+            .any(|seen| match (seen.canonicalize(), dir.canonicalize()) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => seen == dir,
+            });
+        if !duplicated {
+            out.push(dir);
+        }
+    }
+    Ok(out)
+}
+
+/// 重置设备标识（机器码）：扫描 home + `dataBaseDir` 两处 `telemetry-state.json`，
+/// 统一写入同一个新 UUID，各留 `.bak-时间戳` 备份，仅改 `deviceMid` 字段。
+/// 返回成功重置的文件数；一个都没找到时报错。
+pub fn reset_device_mid() -> R<usize> {
+    let new_mid = new_uuid_v4();
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let mut changed = 0usize;
+    let mut last_error: Option<String> = None;
+    for dir in telemetry_candidate_dirs()? {
+        let file = dir.join("telemetry-state.json");
+        if !file.exists() {
+            continue;
+        }
+        let result = (|| -> R<()> {
+            let raw = fs::read_to_string(&file)?;
+            let mut value: Value = serde_json::from_str(&raw)?;
+            let Some(obj) = value.as_object_mut() else {
+                return Err(AppError::Msg("telemetry-state.json 不是 JSON 对象".into()));
+            };
+            let backup = dir.join(format!("telemetry-state.json.bak-{}", ts));
+            fs::write(&backup, raw.as_bytes())?;
+            obj.insert("deviceMid".to_string(), Value::String(new_mid.clone()));
+            match fs::write(&file, serde_json::to_vec_pretty(&value)?) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    // 写回失败则从备份还原，避免留下半成品
+                    let _ = fs::copy(&backup, &file);
+                    Err(AppError::Io(e))
+                }
+            }
+        })();
+        match result {
+            Ok(()) => changed += 1,
+            Err(e) => last_error = Some(e.to_string()),
+        }
+    }
+    if changed == 0 {
+        return Err(AppError::Msg(match last_error {
+            Some(e) => format!("重置 telemetry-state.json 失败：{}", e),
+            None => "未找到任何 telemetry-state.json".into(),
+        }));
+    }
+    Ok(changed)
+}
+
+/// 删除数据目录下的 `coding-plan-cache.json`（ZCode 按新账号重新拉权益）。
+/// 文件不存在/删除失败都返回 false，不影响调用方。
+pub fn clear_coding_plan_cache() -> bool {
+    let Ok(dir) = zcode_v2_dir() else {
+        return false;
+    };
+    fs::remove_file(dir.join("coding-plan-cache.json")).is_ok()
+}
+
+/// 切号后的智能激活检查：用目标账号 token 实时查一次套餐。
+/// - 已激活（套餐非空）→ 不做任何事；
+/// - 未激活（no_plan / 无额度明细）→ 重置机器码 + 清理套餐缓存，铺平激活前置条件；
+/// - 查询失败（网络/接口异常）→ 保守起见不动机器码。
+/// 返回是否执行了激活准备。
+async fn prepare_account_activation(cred_bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(cred_bytes) else {
+        return false;
+    };
+    let quota = match crate::quota::fetch_quota_live(text).await {
+        Ok(q) => q,
+        Err(_) => return false,
+    };
+    let plan_empty = quota.plan_status.as_deref() == Some("no_plan") || quota.balances.is_empty();
+    if !plan_empty {
+        return false;
+    }
+    let _ = reset_device_mid();
+    let _ = clear_coding_plan_cache();
+    true
+}
+
 /// 切换到指定档案：备份当前 → 写入目标凭据（原子写）。
+/// `smart_activate`（默认开）：写入后用目标账号 token 查一次套餐，
+/// 未激活账号自动重置设备标识并清理套餐缓存。
 #[tauri::command]
-pub fn switch_to(id: String) -> R<Profile> {
+pub async fn switch_to(id: String, smart_activate: Option<bool>) -> R<SwitchOutcome> {
     let mut profiles = load_index();
     let idx = profiles
         .iter()
@@ -1141,9 +1271,19 @@ pub fn switch_to(id: String) -> R<Profile> {
         crate::zcode_cdp::schedule_post_switch_refresh();
     }
 
+    // 智能激活：只对 oauth 账号有意义（apikey 账号没有"客户端激活"一说）。
+    // 已激活账号不动机器码；未激活账号才重置设备标识并清缓存。
+    let mut activation_prepared = false;
+    if smart_activate.unwrap_or(true) && mode == "oauth" {
+        activation_prepared = prepare_account_activation(&cred_bytes).await;
+    }
+
     profiles[idx].updated_at = now_ts();
     save_index(&profiles)?;
-    Ok(profile)
+    Ok(SwitchOutcome {
+        profile,
+        activation_prepared,
+    })
 }
 
 /// 重命名档案。

@@ -8,10 +8,29 @@ export interface Glm52PoolStats {
   totalUnits: number;
 }
 
+/**
+ * 选出代表"主力模型剩余额度"的条目。
+ * 当前套餐主力是 GLM-5.3（日额度 300 万），优先取不含 flash 的 GLM-5.3；
+ * 找不到时依次回退：GLM-5.3-Flash → 任意含 glm 的条目（防套餐结构再变时统计全空）。
+ */
 export function findGlm52Balance(quota?: QuotaInfo): BalanceItem | undefined {
-  return quota?.balances?.find((b) =>
-    b.show_name.trim().toLowerCase().includes("glm-5.2")
+  const balances = quota?.balances ?? [];
+  const name = (item: BalanceItem) => item.show_name.trim().toLowerCase();
+  return (
+    balances.find((b) => name(b).includes("glm-5.3") && !name(b).includes("flash")) ??
+    balances.find((b) => name(b).includes("glm-5.3")) ??
+    balances.find((b) => name(b).includes("glm"))
   );
+}
+
+/**
+ * 该账号在服务端是否有生效套餐（已激活）。
+ * `plan_status === "no_plan"` 或 balances 为空都算未激活（新号尚未在客户端发过首句话）。
+ */
+export function isPlanActive(quota?: QuotaInfo): boolean {
+  if (!quota || quota.error) return false;
+  if (quota.plan_status === "no_plan") return false;
+  return (quota.balances?.length ?? 0) > 0;
 }
 
 export function glm52Remaining(quota?: QuotaInfo): number | null {

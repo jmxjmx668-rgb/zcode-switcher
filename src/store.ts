@@ -9,7 +9,7 @@ import {
   type ProxyStatus,
   type QuotaInfo,
 } from "./lib/api";
-import { glm52Remaining } from "./lib/glm52";
+import { glm52Remaining, isPlanActive } from "./lib/glm52";
 import { getTexts, type Language } from "./i18n";
 
 export type ToastKind = "info" | "success" | "error" | "warn";
@@ -27,10 +27,16 @@ const FLOATING_WINDOW_STORAGE_KEY = "zcs:floatingWindowMode";
 
 const GLM52_THRESHOLD_WAN_MIN = 10;
 const GLM52_THRESHOLD_WAN_MAX = 100;
-const GLM52_DEFAULT_THRESHOLD_WAN = 35;
+// 默认 30 万 = GLM-5.3 日额度 300 万的 10%
+const GLM52_DEFAULT_THRESHOLD_WAN = 30;
 const DEFAULT_QUOTA_REFRESH_INTERVAL_MINUTES = 10;
-const DEFAULT_ACTIVE_QUOTA_REFRESH_INTERVAL_MINUTES = 1;
-const ACTIVE_QUOTA_REFRESH_INTERVAL_MINUTES_KEY = "zcs:activeQuotaRefreshIntervalMinutes";
+// 当前账号刷新间隔改用秒制：5 秒 ~ 300 秒，默认 60 秒（等于原默认 1 分钟）
+const ACTIVE_QUOTA_REFRESH_INTERVAL_SECONDS_KEY = "zcs:activeQuotaRefreshIntervalSeconds";
+const LEGACY_ACTIVE_QUOTA_REFRESH_INTERVAL_MINUTES_KEY = "zcs:activeQuotaRefreshIntervalMinutes";
+const DEFAULT_ACTIVE_QUOTA_REFRESH_INTERVAL_SECONDS = 60;
+const ACTIVE_QUOTA_REFRESH_INTERVAL_MIN_SECONDS = 5;
+const ACTIVE_QUOTA_REFRESH_INTERVAL_MAX_SECONDS = 300;
+const SMART_ACTIVATE_ENABLED_KEY = "zcs:smartActivateEnabled";
 const DEFAULT_THEME: Theme = "light";
 const QUOTA_CACHE_KEY = "zcs:quotas";
 const DEFAULT_PROXY_PORT = 17860;
@@ -54,13 +60,15 @@ interface AppState {
   autoRefreshQuota: boolean;
   /** 自动刷新额度的间隔分钟数，0 表示关闭 */
   quotaRefreshIntervalMinutes: number;
-  /** 当前账号刷新间隔分钟数，限制 1-5 分钟 */
-  activeQuotaRefreshIntervalMinutes: number;
+  /** 当前账号刷新间隔秒数，限制 5-300 秒 */
+  activeQuotaRefreshIntervalSeconds: number;
   /** 用来重置定时器倒计时的 tick */
   scheduledRefreshSeq: number;
   glm52AutoSwitchEnabled: boolean;
   /** 自动切换阈值，单位：万 */
   glm52AutoSwitchThresholdWan: number;
+  /** 新账号智能激活：切到未激活账号时自动重置设备标识并清理套餐缓存 */
+  smartActivateEnabled: boolean;
   autoRestart: boolean;
   tryNoRestartSwitch: boolean;
   theme: Theme;
@@ -98,9 +106,10 @@ interface AppState {
   refreshActiveQuotaForAutoSwitch: () => Promise<void>;
   setAutoRefreshQuota: (v: boolean) => void;
   setQuotaRefreshIntervalMinutes: (v: number) => void;
-  setActiveQuotaRefreshIntervalMinutes: (v: number) => void;
+  setActiveQuotaRefreshIntervalSeconds: (v: number) => void;
   setGlm52AutoSwitchEnabled: (v: boolean) => void;
   setGlm52AutoSwitchThresholdWan: (v: number) => void;
+  setSmartActivateEnabled: (v: boolean) => void;
   setAutoRestart: (v: boolean) => void;
   setTryNoRestartSwitch: (v: boolean) => void;
   setTheme: (v: Theme) => void;
@@ -326,17 +335,47 @@ function loadLanguage(): Language {
     return "zh";
   }
 }
-function clampActiveQuotaRefreshIntervalMinutes(v: number): number {
-  if (!Number.isFinite(v)) return DEFAULT_ACTIVE_QUOTA_REFRESH_INTERVAL_MINUTES;
-  return Math.max(1, Math.min(5, Math.round(v)));
+function clampActiveQuotaRefreshIntervalSeconds(v: number): number {
+  if (!Number.isFinite(v)) return DEFAULT_ACTIVE_QUOTA_REFRESH_INTERVAL_SECONDS;
+  return Math.max(
+    ACTIVE_QUOTA_REFRESH_INTERVAL_MIN_SECONDS,
+    Math.min(ACTIVE_QUOTA_REFRESH_INTERVAL_MAX_SECONDS, Math.round(v))
+  );
 }
-function loadActiveQuotaRefreshIntervalMinutes(): number {
+function loadActiveQuotaRefreshIntervalSeconds(): number {
   try {
-    const saved = localStorage.getItem(ACTIVE_QUOTA_REFRESH_INTERVAL_MINUTES_KEY);
-    if (saved === null) return DEFAULT_ACTIVE_QUOTA_REFRESH_INTERVAL_MINUTES;
-    return clampActiveQuotaRefreshIntervalMinutes(Number(saved));
+    const saved = localStorage.getItem(ACTIVE_QUOTA_REFRESH_INTERVAL_SECONDS_KEY);
+    if (saved !== null) {
+      return clampActiveQuotaRefreshIntervalSeconds(Number(saved));
+    }
+    // 旧版存的是分钟（1-5）：检测到旧键时按 ×60 迁移一次写入新键；
+    // 旧键保留不删，回滚旧版 exe 后仍能读回原来的分钟设置。
+    const legacy = localStorage.getItem(LEGACY_ACTIVE_QUOTA_REFRESH_INTERVAL_MINUTES_KEY);
+    if (legacy !== null) {
+      const minutes = Number(legacy);
+      if (Number.isFinite(minutes)) {
+        const seconds = clampActiveQuotaRefreshIntervalSeconds(
+          Math.max(1, Math.min(5, Math.round(minutes))) * 60
+        );
+        try {
+          localStorage.setItem(ACTIVE_QUOTA_REFRESH_INTERVAL_SECONDS_KEY, String(seconds));
+        } catch {
+          /* ignore */
+        }
+        return seconds;
+      }
+    }
+    return DEFAULT_ACTIVE_QUOTA_REFRESH_INTERVAL_SECONDS;
   } catch {
-    return DEFAULT_ACTIVE_QUOTA_REFRESH_INTERVAL_MINUTES;
+    return DEFAULT_ACTIVE_QUOTA_REFRESH_INTERVAL_SECONDS;
+  }
+}
+function loadSmartActivateEnabled(): boolean {
+  try {
+    // 默认开启；显式存过 "0" 才关闭
+    return localStorage.getItem(SMART_ACTIVATE_ENABLED_KEY) !== "0";
+  } catch {
+    return true;
   }
 }
 
@@ -425,7 +464,8 @@ async function maybeSwitchGlm52Account(state: AppState) {
       (item) =>
         item.remaining !== null &&
         item.remaining > threshold &&
-        !item.quota?.error
+        // 只切"已激活"账号：切到服务端套餐为空的未激活号，ZCode 会没有模型可用
+        isPlanActive(item.quota)
     )
     .sort((a, b) => (b.remaining ?? 0) - (a.remaining ?? 0))[0];
 
@@ -433,11 +473,15 @@ async function maybeSwitchGlm52Account(state: AppState) {
     const now = Date.now();
     if (now - lastGlm52NoCandidateAt > 60_000) {
       lastGlm52NoCandidateAt = now;
+      const others = state.profiles.filter((p) => p.id !== active.id);
+      const hasActivatedOther = others.some((p) => isPlanActive(state.quotas[p.id]));
       state.toast(
-        t.glmNoCandidate.replace(
-          "{threshold}",
-          String(state.glm52AutoSwitchThresholdWan)
-        ),
+        hasActivatedOther
+          ? t.glmNoCandidate.replace(
+              "{threshold}",
+              String(state.glm52AutoSwitchThresholdWan)
+            )
+          : t.glmNoActivatedCandidate,
         "warn"
       );
     }
@@ -489,10 +533,11 @@ export const useStore = create<AppState>((set, get) => {
     recentlyRefreshed: {},
     autoRefreshQuota: loadAutoRefresh(),
     quotaRefreshIntervalMinutes: loadQuotaRefreshIntervalMinutes(),
-    activeQuotaRefreshIntervalMinutes: loadActiveQuotaRefreshIntervalMinutes(),
+    activeQuotaRefreshIntervalSeconds: loadActiveQuotaRefreshIntervalSeconds(),
     scheduledRefreshSeq: 0,
     glm52AutoSwitchEnabled: loadGlm52AutoSwitchEnabled(),
     glm52AutoSwitchThresholdWan: loadGlm52AutoSwitchThresholdWan(),
+    smartActivateEnabled: loadSmartActivateEnabled(),
     autoRestart: initialAutoRestart,
     tryNoRestartSwitch: initialTryNoRestartSwitch,
     theme: initialTheme,
@@ -559,7 +604,7 @@ export const useStore = create<AppState>((set, get) => {
   switchTo: async (id) => {
     set({ busy: true });
     try {
-      const { autoRestart, tryNoRestartSwitch } = get();
+      const { autoRestart, tryNoRestartSwitch, smartActivateEnabled } = get();
       // 自动重启路径：先关再写再启，避免写入期间被覆盖
       if (!tryNoRestartSwitch && autoRestart) {
         try {
@@ -568,7 +613,7 @@ export const useStore = create<AppState>((set, get) => {
           /* ignore */
         }
       }
-      const r = await api.switchTo(id);
+      const r = await api.switchTo(id, smartActivateEnabled);
       // 就地翻 active 标记，排序交给渲染层
       set((s) => ({
         profiles: s.profiles.map((p) => ({ ...p, active: p.id === r.id })),
@@ -582,6 +627,11 @@ export const useStore = create<AppState>((set, get) => {
         await get().restartZcode();
       } else {
         toast(t.switchedManualNotice.replace("{name}", r.name), "success");
+      }
+      // 后端智能激活：目标账号未激活时已自动重置机器码并清理套餐缓存，
+      // 提醒用户还差最后一步（在 ZCode 里发一句话过验证码）。
+      if (r.activation_prepared) {
+        toast(t.smartActivatePrepared, "warn");
       }
       if (!hasDisplayableQuota(get().quotas[id])) {
         set((s) => ({ loadingQuota: { ...s.loadingQuota, [id]: true } }));
@@ -825,14 +875,23 @@ export const useStore = create<AppState>((set, get) => {
     set({ quotaRefreshIntervalMinutes: minutes });
   },
 
-  setActiveQuotaRefreshIntervalMinutes: (v) => {
-    const minutes = clampActiveQuotaRefreshIntervalMinutes(v);
+  setActiveQuotaRefreshIntervalSeconds: (v) => {
+    const seconds = clampActiveQuotaRefreshIntervalSeconds(v);
     try {
-      localStorage.setItem(ACTIVE_QUOTA_REFRESH_INTERVAL_MINUTES_KEY, String(minutes));
+      localStorage.setItem(ACTIVE_QUOTA_REFRESH_INTERVAL_SECONDS_KEY, String(seconds));
     } catch {
       /* ignore */
     }
-    set({ activeQuotaRefreshIntervalMinutes: minutes });
+    set({ activeQuotaRefreshIntervalSeconds: seconds });
+  },
+
+  setSmartActivateEnabled: (v) => {
+    try {
+      localStorage.setItem(SMART_ACTIVATE_ENABLED_KEY, v ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+    set({ smartActivateEnabled: v });
   },
 
   setGlm52AutoSwitchEnabled: (v) => {

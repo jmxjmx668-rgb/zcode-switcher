@@ -114,7 +114,11 @@ export const api = {
       "capture_current",
       { name }
     ),
-  switchTo: (id: string) => cmd<{ id: string; name: string }>("switch_to", { id }),
+  switchTo: (id: string, smartActivate: boolean) =>
+    cmd<{ id: string; name: string; activation_prepared?: boolean }>("switch_to", {
+      id,
+      smartActivate,
+    }),
   renameProfile: (id: string, name: string) => cmd<boolean>("rename_profile", { id, name }),
   deleteProfile: (id: string) => cmd<boolean>("delete_profile", { id }),
   exportProfileToFile: (id: string, path: string) =>
