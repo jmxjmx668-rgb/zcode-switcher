@@ -391,6 +391,7 @@ pub fn run() {    tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         // 单实例：OAuth 深链接拉起新进程时，把启动参数转发给已在运行的主实例后退出
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            use tauri::Manager;
             for arg in argv.iter().skip(1) {
                 if oauth::handle_deep_link_argument(&arg) {
                     if let Some(window) = app.get_webview_window("main") {
