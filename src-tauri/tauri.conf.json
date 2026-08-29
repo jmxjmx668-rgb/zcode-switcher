@@ -10,11 +10,6 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "deepLink": {
-      "desktop": {
-        "schemes": ["zcodeswitcher"]
-      }
-    },
     "windows": [
       {
         "title": "ZCode Switcher",
