@@ -1,0 +1,35 @@
+name: Build fixed exe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - run: npm ci
+
+      - name: Build Tauri app (no bundle)
+        run: npx tauri build --no-bundle
+
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zcode-switcher-fixed
+          path: src-tauri/target/release/zcode-switcher.exe
+          if-no-files-found: error

@@ -7,9 +7,47 @@ use serde_json::Value;
 use std::{fs, path::PathBuf, time::SystemTime};
 
 use crate::crypto;
+use crate::profile;
 
 const BASE: &str = "https://zcode.z.ai";
 const APP_VERSION_CANDIDATES: &[&str] = &["3.2.5", crate::captcha::ZCODE_APP_VERSION];
+
+/// billing/balance 自 2026-08 起强制校验 X-Device-Mid 头，缺失返回 code=3001 parameter error。
+/// 优先复用 ZCode 官方客户端的设备标识（telemetry-state.json 的 deviceMid），
+/// 读不到时回退为按家目录派生的稳定 UUID（实测服务端仅校验头存在性，不比对值）。
+fn resolve_device_mid() -> String {
+    if let Ok(dir) = profile::zcode_v2_dir() {
+        let telemetry = dir.join("telemetry-state.json");
+        if let Ok(text) = fs::read_to_string(&telemetry) {
+            if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                if let Some(mid) = value
+                    .get("deviceMid")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    return mid.to_string();
+                }
+            }
+        }
+    }
+    use std::hash::{Hash, Hasher};
+    let seed = dirs::home_dir().map(|p| p.to_string_lossy().into_owned());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    seed.hash(&mut hasher);
+    let a = hasher.finish();
+    seed.hash(&mut hasher);
+    let b = hasher.finish();
+    let hex = format!("{a:016x}{b:016x}");
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
 
 /// 单个模型的用量条目（balance.data.balances[]）。
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
@@ -233,6 +271,7 @@ async fn get_with_retry(
         let result = client
             .get(url)
             .header("Authorization", format!("Bearer {}", token))
+            .header("X-Device-Mid", resolve_device_mid())
             .send()
             .await;
 
