@@ -130,7 +130,17 @@ pub async fn fetch_quota(creds_text: &str) -> Result<QuotaInfo, String> {
         .filter_map(parse_balance_item)
         .collect();
     if balances.is_empty() {
-        return Err("额度接口未返回可显示的模型额度明细".into());
+        // 接口成功（code=0）但没有任何套餐/额度明细：账号本身没有生效的 plan
+        // （常见于刚 OAuth 导入、尚未在 ZCode 客户端激活免费套餐的账号）。
+        // 这是合法状态而非错误——返回 no_plan 标记，前端显示"无生效套餐"，
+        // 之前的做法是报错并被 UI 误显示为"未登录，请点击切换后重试"。
+        return Ok(QuotaInfo {
+            plan_name,
+            plan_description,
+            plan_status: Some("no_plan".into()),
+            plan_ends_at,
+            balances,
+        });
     }
 
     Ok(QuotaInfo {

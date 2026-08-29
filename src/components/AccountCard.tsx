@@ -152,6 +152,8 @@ function AccountCard({
   const quotaErr = quota?.error
     ? describeQuotaError(quota.error, t, showQuota || profile.active)
     : null;
+  // 无生效套餐（接口成功但无 plan/balances）：显示引导文案而非错误
+  const noPlan = quota?.plan_status === "no_plan";
   const showQuotaLoading = quotaLoading && !showQuota;
 
   if (!isListView) {
@@ -239,6 +241,8 @@ function AccountCard({
           className={`mt-1 block truncate text-[10px] ${
             showQuotaLoading
               ? "font-medium text-text-secondary"
+              : noPlan
+              ? "font-medium text-text-muted"
               : quotaErr
               ? `font-medium ${quotaErr.className}`
               : refreshOk
@@ -249,6 +253,8 @@ function AccountCard({
         >
           {showQuotaLoading
             ? t.quotaLoadingLabel
+            : noPlan
+            ? t.quotaNoPlan
             : quotaErr
             ? quotaErr.text
             : refreshOk
