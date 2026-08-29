@@ -3,10 +3,18 @@
 //! 旧的 /oauth/cli/init + /oauth/cli/poll 接口已经不可用。新版 ZCode 客户端
 //! 使用 Z.ai 授权码流程：
 //!   1. 打开 chat.z.ai/api/oauth/authorize
-//!   2. 浏览器回调本机 127.0.0.1 临时端口，拿到 code + state
+//!   2. 授权完成后经 zcode.z.ai/app/oauth/login 中转页重定向到深链接回调
+//!      （旧版 127.0.0.1 临时端口回调已被服务端 redirect_uri 白名单拒绝，
+//!      报 "Redirect URI not registered for this client"；实测白名单只认
+//!      zcode.z.ai 中转页，但中转页的 redirect 参数允许自定义 scheme）
 //!   3. POST zcode.z.ai/api/v1/oauth/token 交换 ZCode JWT 与 Z.ai access token
 //!   4. POST api.z.ai/api/auth/z/login 把 Z.ai token 换成 ZCode 业务 access token
 //!   5. 组装 portable JSON，复用 profile::import_profile_json 导入账号
+//!
+//! 回调捕获走双通道：
+//!   - 主通道：本应用注册的 zcodeswitcher:// 深链接（Windows 协议注册，
+//!     浏览器授权完成后系统拉起本 exe，启动参数里带回调 URL）
+//!   - 备通道：本地 127.0.0.1 回调服务器（万一服务端恢复对 loopback 的放行）
 
 use axum::{
     extract::{Query, State},
@@ -33,6 +41,10 @@ const CLIENT_ID: &str = "client_P8X5CMWmlaRO9gyO-KSqtg";
 const CALLBACK_PATH: &str = "/oauth/callback";
 const DEFAULT_DEADLINE_SECONDS: u64 = 600;
 const HTTP_TIMEOUT_SECONDS: u64 = 20;
+/// 本应用注册的自定义协议：授权完成后浏览器经中转页拉起本应用
+const APP_SCHEME: &str = "zcodeswitcher";
+/// 官方中转页（服务端 redirect_uri 白名单目前只认 zcode.z.ai 域）
+const OAUTH_RELAY_PAGE: &str = "https://zcode.z.ai/app/oauth/login";
 
 #[derive(Debug, Serialize)]
 pub struct OAuthInit {
@@ -46,6 +58,52 @@ struct PendingFlow {
     redirect_uri: String,
     receiver: oneshot::Receiver<Result<CallbackData, String>>,
     shutdown: Option<oneshot::Sender<()>>,
+}
+
+/// 深链接回调投递通道：协议拉起本 exe 时（启动参数带回调 URL），
+/// 把 URL 塞进这里，正在等待的 OAuth 流程从另一端取走。
+fn deep_link_channel() -> &'static Mutex<Option<oneshot::Sender<Result<CallbackData, String>>>> {
+    static CHANNEL: OnceLock<Mutex<Option<oneshot::Sender<Result<CallbackData, String>>>>> =
+        OnceLock::new();
+    CHANNEL.get_or_init(|| Mutex::new(None))
+}
+
+/// 早到的深链接缓存：回调比 oauth_init 先到时（单实例转发竞态）暂存，
+/// oauth_init 建立通道后立即消费。
+fn early_deep_link() -> &'static Mutex<Option<CallbackData>> {
+    static EARLY: OnceLock<Mutex<Option<CallbackData>>> = OnceLock::new();
+    EARLY.get_or_init(|| Mutex::new(None))
+}
+
+/// 处理通过启动参数传入的深链接回调 URL（zcodeswitcher://oauth/callback?...）。
+/// 返回 true 表示 URL 是有效的 OAuth 回调且已投递给等待中的流程（或已暂存）。
+pub fn handle_deep_link_argument(arg: &str) -> bool {
+    let arg = arg.trim();
+    if !arg
+        .to_ascii_lowercase()
+        .starts_with(&format!("{}://", APP_SCHEME))
+    {
+        return false;
+    }
+    let Some(callback) = parse_callback_url(arg) else {
+        return false;
+    };
+    let sender = deep_link_channel()
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    match sender {
+        Some(sender) => sender.send(Ok(callback)).is_ok(),
+        None => {
+            // 没有等待中的流程：暂存，oauth_init 时若发现直接消费
+            if let Ok(mut slot) = early_deep_link().lock() {
+                *slot = Some(callback);
+                true
+            } else {
+                false
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -284,6 +342,38 @@ fn build_authorize_url(state: &str, redirect_uri: &str) -> Result<String, String
     Ok(url.to_string())
 }
 
+/// 构造新版 redirect_uri：官方中转页 + 指定最终深链接。
+/// 服务端白名单只认 zcode.z.ai 中转页；中转页的 redirect 参数允许
+/// 自定义 scheme（实测 zcodeswitcher:// 与官方 zcode:// 均放行）。
+fn build_relay_redirect_uri(final_redirect: &str) -> Result<String, String> {
+    let mut url = reqwest::Url::parse(OAUTH_RELAY_PAGE)
+        .map_err(|e| format!("中转页地址解析失败:{}", e))?;
+    url.query_pairs_mut()
+        .append_pair("redirect", final_redirect)
+        .append_pair("app_version", crate::captcha::ZCODE_APP_VERSION);
+    Ok(url.to_string())
+}
+
+/// 从回调 URL（深链接或 HTTP）解析 code/state
+fn parse_callback_url(url_str: &str) -> Option<CallbackData> {
+    let url = reqwest::Url::parse(url_str.trim()).ok()?;
+    let mut code = None;
+    let mut state = None;
+    for (k, v) in url.query_pairs() {
+        match k.as_ref() {
+            "code" | "authCode" => code = Some(v.into_owned()),
+            "state" => state = Some(v.into_owned()),
+            _ => {}
+        }
+    }
+    let code = code?;
+    let state = state.unwrap_or_default();
+    if code.is_empty() {
+        return None;
+    }
+    Some(CallbackData { code, state })
+}
+
 async fn start_callback_server(
     state: String,
 ) -> Result<
@@ -323,11 +413,48 @@ async fn start_callback_server(
 ///
 /// 为了兼容前端旧接口字段：
 /// - flow_id = state
-/// - poll_token = redirect_uri
+/// - poll_token = redirect_uri（新版为中转页 URL）
+///
+/// 回调捕获双通道：
+/// - 主通道 zcodeswitcher:// 深链接（本 exe 注册的协议，浏览器授权后拉起）
+/// - 备通道本地 127.0.0.1 HTTP 回调（防止服务端将来恢复 loopback 放行）
 #[tauri::command]
 pub async fn oauth_init() -> Result<OAuthInit, String> {
     let state = random_hex(24);
-    let (redirect_uri, receiver, shutdown) = start_callback_server(state.clone()).await?;
+
+    // 主通道：深链接 oneshot
+    let (deep_sender, deep_receiver) = oneshot::channel::<Result<CallbackData, String>>();
+    {
+        let mut slot = deep_link_channel()
+            .lock()
+            .map_err(|_| "OAuth 流程状态锁定失败".to_string())?;
+        // 清掉残留的旧 sender
+        *slot = Some(deep_sender);
+    }
+    // 消费可能早到的深链接回调（单实例转发竞态下先于 init 到达）
+    if let Ok(mut early) = early_deep_link().lock() {
+        if let Some(callback) = early.take() {
+            if callback.state == state
+                && deep_link_channel()
+                    .lock()
+                    .ok()
+                    .and_then(|mut slot| slot.take())
+                    .map(|sender| sender.send(Ok(callback)).is_ok())
+                    .unwrap_or(false)
+            {
+                // 已即时投递，直接进入等待（会被立刻唤醒）
+            }
+        }
+    }
+
+    // 备通道：本地 HTTP 回调服务器（http_redirect_uri 仅用于启动服务器本身，
+    // 不参与新版 redirect_uri；保留服务器等待将来服务端恢复 loopback 放行）
+    let (_http_redirect_uri, http_receiver, http_shutdown) =
+        start_callback_server(state.clone()).await?;
+
+    // redirect_uri 走官方中转页，最终深链接指向本应用协议
+    let deep_callback = format!("{}://{}", APP_SCHEME, "oauth/callback");
+    let redirect_uri = build_relay_redirect_uri(&deep_callback)?;
     let authorize_url = build_authorize_url(&state, &redirect_uri)?;
 
     let mut pending = pending_flow()
@@ -341,8 +468,8 @@ pub async fn oauth_init() -> Result<OAuthInit, String> {
     *pending = Some(PendingFlow {
         state: state.clone(),
         redirect_uri: redirect_uri.clone(),
-        receiver,
-        shutdown: Some(shutdown),
+        receiver: merge_receivers(deep_receiver, http_receiver),
+        shutdown: Some(http_shutdown),
     });
 
     Ok(OAuthInit {
@@ -350,6 +477,25 @@ pub async fn oauth_init() -> Result<OAuthInit, String> {
         authorize_url,
         poll_token: redirect_uri,
     })
+}
+
+/// 合并深链接与 HTTP 两条回调通道：任一先到即胜出。
+fn merge_receivers(
+    deep: oneshot::Receiver<Result<CallbackData, String>>,
+    http: oneshot::Receiver<Result<CallbackData, String>>,
+) -> oneshot::Receiver<Result<CallbackData, String>> {
+    let (sender, receiver) = oneshot::channel();
+    tokio::spawn(async move {
+        tokio::select! {
+            result = deep => {
+                let _ = sender.send(result.unwrap_or(Err("深链接回调通道已关闭".into())));
+            }
+            result = http => {
+                let _ = sender.send(result.unwrap_or(Err("OAuth 回调通道已关闭".into())));
+            }
+        }
+    });
+    receiver
 }
 
 /// 等待本地回调，交换 token，并导入账号。
