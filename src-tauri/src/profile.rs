@@ -1101,7 +1101,7 @@ fn telemetry_candidate_dirs() -> R<Vec<PathBuf>> {
             .iter()
             .any(|seen| match (seen.canonicalize(), dir.canonicalize()) {
                 (Ok(a), Ok(b)) => a == b,
-                _ => seen == dir,
+                _ => seen == &dir,
             });
         if !duplicated {
             out.push(dir);
@@ -1168,7 +1168,7 @@ pub fn clear_coding_plan_cache() -> bool {
 /// - 已激活（套餐非空）→ 不做任何事；
 /// - 未激活（no_plan / 无额度明细）→ 重置机器码 + 清理套餐缓存，铺平激活前置条件；
 /// - 查询失败（网络/接口异常）→ 保守起见不动机器码。
-/// 返回是否执行了激活准备。
+/// 返回是否成功执行了激活准备（机器码重置失败时不给前端报"已重置"）。
 async fn prepare_account_activation(cred_bytes: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(cred_bytes) else {
         return false;
@@ -1181,9 +1181,9 @@ async fn prepare_account_activation(cred_bytes: &[u8]) -> bool {
     if !plan_empty {
         return false;
     }
-    let _ = reset_device_mid();
+    let reset_ok = reset_device_mid().is_ok();
     let _ = clear_coding_plan_cache();
-    true
+    reset_ok
 }
 
 /// 切换到指定档案：备份当前 → 写入目标凭据（原子写）。

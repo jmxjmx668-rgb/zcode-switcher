@@ -642,6 +642,9 @@ export const useStore = create<AppState>((set, get) => {
           }
           await get().refreshQuota(id);
           if (hasDisplayableQuota(get().quotas[id])) break;
+          // no_plan 是稳定的最终状态（新号未激活），继续轮询没有意义
+          const q = get().quotas[id];
+          if (q && !q.error && q.plan_status === "no_plan") break;
         }
       }
       return true;
